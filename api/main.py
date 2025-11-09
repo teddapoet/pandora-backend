@@ -18,10 +18,9 @@ app.add_middleware(
     allow_credentials=True,
 )
 
-# Pydantic models for checking and validation
+# Pydantic models for checking and validation (minimal)
 class SessionStartResponse(BaseModel):
     session_id: str
-    started_at: datetime
 
 
 class WarmupPayload(BaseModel):
@@ -30,30 +29,20 @@ class WarmupPayload(BaseModel):
 
 class EventPayload(BaseModel):
     timestamp_ms: int # time when the event happened in milliseconds
-    # tile_id: Optional[str] 
     hit: bool # hit or miss
     flex_angle: float # that was measured when pressing the tile
 
 
 class FinishResponse(BaseModel):
-    session_id: str
-    baseline: float
-    total_events: int   # can count miss rate 
-    counted_hits: int
     score: int
-    finished_at: datetime
 
 
 class SessionDetail(BaseModel):
-    session_id: str
-    started_at: datetime
-    finished_at: Optional[datetime]
-    baseline: Optional[float]
     score: Optional[int]
-    total_events: int
+    baseline: Optional[float]
 
 
-# In-memory, will replace alter
+# In-memory, will replace later with supabase postgresql
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -73,7 +62,7 @@ def start_session() -> SessionStartResponse:
         "events": [],  # type: List[EventPayload]
         "score": None,
     }
-    return SessionStartResponse(session_id=session_id, started_at=now)
+    return SessionStartResponse(session_id=session_id)
 
 
 @app.post("/api/v1/sessions/{session_id}/warmup")
@@ -94,7 +83,7 @@ def record_event(session_id: str, payload: EventPayload) -> Dict[str, int]:
     return {"total_events": len(session["events"])}
 
 
-# Return the score and other details when the session is finished (summary)
+# Return the score when the session is finished (summary)
 @app.post("/api/v1/sessions/{session_id}/finish", response_model=FinishResponse)
 def finish_session(session_id: str) -> FinishResponse:
     session = SESSIONS.get(session_id)
@@ -115,14 +104,7 @@ def finish_session(session_id: str) -> FinishResponse:
     session["finished_at"] = finished_at
     session["score"] = score
 
-    return FinishResponse(
-        session_id=session_id,
-        baseline=float(baseline),
-        total_events=len(events),
-        counted_hits=counted_hits,
-        score=score,
-        finished_at=finished_at,
-    )
+    return FinishResponse(score=score)
 
 
 @app.get("/api/v1/sessions/{session_id}", response_model=SessionDetail)
@@ -131,10 +113,6 @@ def get_session(session_id: str) -> SessionDetail:
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return SessionDetail(
-        session_id=session_id,
-        started_at=session["started_at"],
-        finished_at=session["finished_at"],
         baseline=session["baseline"],
         score=session["score"],
-        total_events=len(session["events"]),
     )
