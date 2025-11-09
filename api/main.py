@@ -5,11 +5,28 @@ from typing import List, Optional, Dict, Any
 from uuid import uuid4 # randomly generated session id
 from datetime import datetime
 from enum import Enum
+from dotenv import load_dotenv
+import os
+from fastapi import status
+from supabase import create_client, Client
+
+load_dotenv()
 
 app = FastAPI(
     title="Handora Games API",
     description="API for Handora Games",
 )
+
+# Initialize Supabase client (prefer service role key on server)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+supabase: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    except Exception as e:
+        print("Supabase client init error:", e)
+        supabase = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -89,6 +106,19 @@ def start_session(payload: SessionStartPayload) -> SessionStartResponse:
         "score": None,
         "metrics": None,
     }
+    # Persist to Supabase (best-effort)
+    if supabase:
+        try:
+            supabase.table("sessions").insert({
+                "id": session_id,
+                "game_key": payload.game_key.value,
+                "started_at": now.isoformat(),
+                "score": 0,
+                "baseline_by_finger": SESSIONS[session_id]["baseline_by_finger"] or {},
+                "metrics": SESSIONS[session_id]["metrics"] or {},
+            }).execute()
+        except Exception as e:
+            print("Supabase insert error (start_session):", e)
     return SessionStartResponse(session_id=session_id)
 
 
@@ -99,6 +129,13 @@ def set_warmup_baseline(session_id: str, payload: WarmupPayload) -> Dict[str, Di
         raise HTTPException(status_code=404, detail="Session is not found in our database")
     if payload.baseline_by_finger is not None:
         session["baseline_by_finger"] = payload.baseline_by_finger
+        if supabase:
+            try:
+                supabase.table("sessions") \
+                    .update({"baseline_by_finger": payload.baseline_by_finger}) \
+                    .eq("id", session_id).execute()
+            except Exception as e:
+                print("Supabase update error (warmup):", e)
     return {"baseline_by_finger": session.get("baseline_by_finger") or {}}
 
 
@@ -126,12 +163,37 @@ def finish_session(session_id: str, payload: FinishPayload) -> EventPayload:
         k: v for k, v in payload.model_dump(exclude_none=True).items() if k in trait_keys
     }
     session["metrics"] = metrics
+    if supabase:
+        try:
+            supabase.table("sessions") \
+                .update({
+                    "finished_at": finished_at.isoformat(),
+                    "score": payload.score,
+                    "metrics": metrics,
+                }).eq("id", session_id).execute()
+        except Exception as e:
+            print("Supabase update error (finish):", e)
 
-    return EventPayload(metrics=metrics)
+    return EventPayload(**metrics)
 
 
 @app.get("/api/v1/sessions/{session_id}", response_model=SessionDetail)
 def get_session(session_id: str) -> SessionDetail:
+    # Prefer DB if available; fall back to in-memory
+    if supabase:
+        try:
+            res = supabase.table("sessions").select("*").eq("id", session_id).single().execute()
+            row = getattr(res, "data", None) or None
+            if row:
+                return SessionDetail(
+                    baseline_by_finger=row.get("baseline_by_finger"),
+                    score=row.get("score"),
+                    game_key=row.get("game_key"),
+                    started_at=row.get("started_at"),
+                    finished_at=row.get("finished_at"),
+                )
+        except Exception as e:
+            print("Supabase select error (get_session):", e)
     session = SESSIONS.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
