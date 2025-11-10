@@ -54,6 +54,10 @@ class GameKey(str, Enum):
     space_invader = "space_invader"
     dinosaur = "dinosaur"
 
+class LLMAnalysisRequest(BaseModel):
+    prompt: str
+    metrics: Optional[Dict[str, Any]] = None
+
 class LLMResp(BaseModel):
     analysis: str
 
@@ -215,6 +219,90 @@ def get_session(session_id: str) -> SessionDetail:
     )
 
 
+@app.get("/api/v1/sessions/{session_id}/with-history")
+def get_session_with_history(session_id: str) -> Dict[str, Any]:
+    """Returns current session + previous sessions of the same game."""
+    current = None
+    history = []
+    
+    # Get current session
+    if supabase:
+        try:
+            res = supabase.table("sessions").select("*").eq("id", session_id).single().execute()
+            row = getattr(res, "data", None)
+            if row:
+                current = row
+                game_key = row.get("game_key")
+                # Get previous sessions of same game
+                hist_res = supabase.table("sessions") \
+                    .select("*") \
+                    .eq("game_key", game_key) \
+                    .neq("id", session_id) \
+                    .order("started_at", desc=False) \
+                    .limit(10) \
+                    .execute()
+                history = getattr(hist_res, "data", None) or []
+        except Exception as e:
+            print("Supabase error (get_session_with_history):", e)
+    
+    # Fallback to in-memory
+    if not current:
+        sess = SESSIONS.get(session_id)
+        if not sess:
+            raise HTTPException(status_code=404, detail="Session not found")
+        current = {
+            "id": session_id,
+            "game_key": sess.get("game_key"),
+            "score": sess.get("score"),
+            "baseline_by_finger": sess.get("baseline_by_finger"),
+            "metrics": sess.get("metrics"),
+            "started_at": sess.get("started_at").isoformat() if sess.get("started_at") else None,
+            "finished_at": sess.get("finished_at").isoformat() if sess.get("finished_at") else None,
+        }
+        game_key = sess.get("game_key")
+        for sid, s in SESSIONS.items():
+            if sid != session_id and s.get("game_key") == game_key:
+                history.append({
+                    "id": sid,
+                    "score": s.get("score"),
+                    "started_at": s.get("started_at").isoformat() if s.get("started_at") else None,
+                })
+    
+    return {"current": current, "history": history}
+
+
+@app.get("/api/v1/sessions")
+def get_all_sessions() -> List[SessionDetail]:
+    """Returns all sessions from DB (or in-memory fallback)."""
+    sessions_list = []
+    # Try Supabase first
+    if supabase:
+        try:
+            res = supabase.table("sessions").select("*").order("started_at", desc=True).limit(50).execute()
+            rows = getattr(res, "data", None) or []
+            for row in rows:
+                sessions_list.append(SessionDetail(
+                    baseline_by_finger=row.get("baseline_by_finger"),
+                    score=row.get("score"),
+                    game_key=row.get("game_key"),
+                    started_at=row.get("started_at"),
+                    finished_at=row.get("finished_at"),
+                ))
+        except Exception as e:
+            print("Supabase select error (get_all_sessions):", e)
+    # Fallback to in-memory
+    if not sessions_list:
+        for sid, sess in SESSIONS.items():
+            sessions_list.append(SessionDetail(
+                baseline_by_finger=sess.get("baseline_by_finger"),
+                score=sess.get("score"),
+                game_key=sess.get("game_key"),
+                started_at=sess.get("started_at"),
+                finished_at=sess.get("finished_at"),
+            ))
+    return sessions_list
+
+
 @app.get("/api/v1/analytics/highscores")
 def get_highscores() -> Dict[str, int]:
     """
@@ -227,15 +315,32 @@ def get_highscores() -> Dict[str, int]:
         GameKey.piano_tiles: None,
         GameKey.space_invader: None,
         GameKey.dinosaur: None,
-    }
-    for _sid, sess in SESSIONS.items():
-        score = sess.get("score")
-        game_key = sess.get("game_key")
-        if score is None or game_key not in max_by_game:
-            continue
-        current = max_by_game[game_key]
-        if current is None or score > current:
-            max_by_game[game_key] = score
+    } 
+    # Try Supabase first
+    if supabase:
+        try:
+            res = supabase.table("sessions").select("game_key,score").execute()
+            rows = getattr(res, "data", None) or []
+            for row in rows:
+                gk = row.get("game_key")
+                sc = row.get("score")
+                if sc is not None and gk in [e.value for e in GameKey]:
+                    game_enum = GameKey(gk)
+                    if game_enum in max_by_game:
+                        if max_by_game[game_enum] is None or sc > max_by_game[game_enum]:
+                            max_by_game[game_enum] = sc
+        except Exception as e:
+            print("Supabase select error (get_highscores):", e)
+    # Fallback to in-memory
+    if all(v is None for v in max_by_game.values()):
+        for _sid, sess in SESSIONS.items():
+            score = sess.get("score")
+            game_key = sess.get("game_key")
+            if score is None or game_key not in max_by_game:
+                continue
+            current = max_by_game[game_key]
+            if current is None or score > current:
+                max_by_game[game_key] = score
 
     return {
         "1": max_by_game[GameKey.piano_tiles] or 0,
@@ -244,24 +349,25 @@ def get_highscores() -> Dict[str, int]:
     }
 
 @app.post("/api/v1/analytics/analyze", response_model=LLMResp)
-def analyze_metrics(payload: EventPayload) -> LLMResp:
+def analyze_metrics(payload: LLMAnalysisRequest) -> LLMResp:
     if not gemini_client:
         raise HTTPException(status_code=503, detail="Gemini not configured")
 
     system_prompt = (
-        "You are a rehab game assistant. Analyze the provided single-session metrics "
+        "You are a rehab game assistant named Dora. Analyze the provided single-session metrics "
         "for a player's hand usage. Avoid medical diagnosis as you are not really a doctor; use neutral language "
         "like 'may indicate' or 'appears'. Focus on accuracy, rom_percent, flex_angle, "
-        "reaction_time, smoothness, and score if present. Provide 3–5 sentences plus 1–2 "
-        "actionable tips. Keep it concise."
+        "reaction_time, smoothness, baseline_by_finger, and score if present. Provide 3–5 sentences plus 1–2 "
+        "actionable tips. Keep it concise and encouraging."
     )
 
-    metrics_json = json.dumps(payload.model_dump(exclude_none=True))
+    metrics_json = json.dumps(payload.metrics or {})
+    user_message = f"{payload.prompt}\n\nMETRICS_JSON:\n{metrics_json}"
 
     try:
         resp = gemini_client.models.generate_content(
             model=GEMINI_MODEL_ID,
-            contents=f"{system_prompt}\n\nMETRICS_JSON:\n{metrics_json}"
+            contents=f"{system_prompt}\n\n{user_message}"
         )
         return LLMResp(analysis=(resp.text or "").strip())
     except Exception as e:
